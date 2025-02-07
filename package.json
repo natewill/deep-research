@@ -20,11 +20,18 @@
     "typescript": "^5.7.3"
   },
   "dependencies": {
+    "@ai-sdk/deepinfra": "^0.1.9",
+    "@ai-sdk/deepseek": "^0.1.8",
+    "@ai-sdk/google": "^1.1.10",
+    "@ai-sdk/groq": "^1.1.7",
     "@ai-sdk/openai": "^1.1.9",
+    "@ai-sdk/togetherai": "^0.1.9",
     "@mendable/firecrawl-js": "^1.16.0",
     "ai": "^4.1.17",
+    "dotenv": "^16.4.7",
     "js-tiktoken": "^1.0.17",
     "lodash-es": "^4.17.21",
+    "md-to-pdf": "^5.2.4",
     "p-limit": "^6.2.0",
     "zod": "^3.24.1"
   },

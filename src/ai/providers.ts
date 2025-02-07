@@ -1,17 +1,61 @@
 import { createOpenAI } from '@ai-sdk/openai';
+import { createDeepSeek } from '@ai-sdk/deepseek';
+import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { getEncoding } from 'js-tiktoken';
-
+import { createGroq } from '@ai-sdk/groq';
+import { createTogetherAI } from '@ai-sdk/togetherai';
 import { RecursiveCharacterTextSplitter } from './text-splitter';
+import { createDeepInfra } from '@ai-sdk/deepinfra';
 
 // Providers
+
+
+
+
+const google = createGoogleGenerativeAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
+
+const deepseek = createDeepSeek({
+  apiKey: process.env.DEEPSEEK_API_KEY,
+});
+
+const togetherai = createTogetherAI({
+  apiKey: process.env.TOGETHER_AI_API_KEY,
+});
+
+const groq = createGroq({
+  apiKey: process.env.GROQ_API_KEY,
+})
 
 const openai = createOpenAI({
   apiKey: process.env.OPENAI_KEY!,
 });
 
+const deepinfra = createDeepInfra({
+  apiKey: process.env.DEEPINFRA_API_KEY,
+});
+
+
 // Models
 
-export const gpt4Model = openai('gpt-4o', {
+export const groqR1 = groq('llama-3.3-70b-versatile', {
+
+})
+
+export const infraR1 = deepinfra('deepseek-ai/DeepSeek-R1')
+
+export const togetherR1 = togetherai('deepseek-ai/DeepSeek-R1-Distill-Llama-70B');
+
+export const gemini = google('gemini-2.0-flash-thinking-exp-01-21', {
+  structuredOutputs: false,
+})
+
+export const deepseekR1 = deepseek('deepseek-reasoner', {
+
+});
+
+export const gpt4Model = openai('gpt4o', {
   structuredOutputs: true,
 });
 export const gpt4MiniModel = openai('gpt-4o-mini', {

@@ -1,7 +1,7 @@
 import * as fs from 'fs/promises';
 import * as readline from 'readline';
 
-import { deepResearch, writeFinalReport } from './deep-research';
+import { deepResearch, writeFinalReportPdf } from './deep-research';
 import { generateFeedback } from './feedback';
 
 const rl = readline.createInterface({
@@ -66,17 +66,14 @@ ${followUpQuestions.map((q, i) => `Q: ${q}\nA: ${answers[i]}`).join('\n')}
   console.log(`\n\nVisited URLs (${visitedUrls.length}):\n\n${visitedUrls.join('\n')}`);
   console.log('Writing final report...');
 
-  const report = await writeFinalReport({
+  const path = await writeFinalReportPdf({
     prompt: combinedQuery,
     learnings,
     visitedUrls,
   });
 
   // Save report to file
-  await fs.writeFile('output.md', report, 'utf-8');
-
-  console.log(`\n\nFinal Report:\n\n${report}`);
-  console.log('\nReport has been saved to output.md');
+  console.log(`\nReport has been saved to ${path}`);
   rl.close();
 }
 

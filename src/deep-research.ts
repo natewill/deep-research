@@ -1,28 +1,75 @@
 import FirecrawlApp, { SearchResponse } from '@mendable/firecrawl-js';
-import { generateObject } from 'ai';
+import { generateText } from 'ai';
 import { compact } from 'lodash-es';
 import pLimit from 'p-limit';
 import { z } from 'zod';
+import { mdToPdf } from 'md-to-pdf';
+import fs from 'fs';
 
-import { o3MiniModel, trimPrompt } from './ai/providers';
+import {
+  o3MiniModel,
+  trimPrompt,
+  gpt4Model,
+  gpt4MiniModel,
+  deepseekR1,
+  groqR1,
+  gemini,
+  togetherR1,
+  infraR1,
+} from './ai/providers';
 import { systemPrompt } from './prompt';
+
+const curr_model = gemini;
 
 type ResearchResult = {
   learnings: string[];
   visitedUrls: string[];
 };
 
-// increase this if you have higher API rate limits
 const ConcurrencyLimit = 2;
-
-// Initialize Firecrawl with optional API key and optional base url
 
 const firecrawl = new FirecrawlApp({
   apiKey: process.env.FIRECRAWL_KEY ?? '',
   apiUrl: process.env.FIRECRAWL_BASE_URL,
 });
 
-// take en user query, return a list of SERP queries
+// helper to safely generate json from generateText output
+async function safeGenerate<T>({
+  model,
+  system,
+  prompt,
+  schema,
+  abortSignal,
+}: {
+  model: any;
+  system: string;
+  prompt: string;
+  schema: z.Schema<T>;
+  abortSignal?: AbortSignal;
+}): Promise<T> {
+  const response = await generateText({ model, system, prompt, abortSignal });
+  const responseText = response.text ?? '';
+
+  // extract json using regex
+  const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/i);
+  const jsonString = jsonMatch && jsonMatch[1] ? jsonMatch[1].trim() : responseText.trim();
+
+  console.log("raw json response:", jsonString);
+
+  try {
+    // sanitize json (removes control characters & fixes common issues)
+    const sanitizedJson = jsonString
+      .replace(/[\u0000-\u001F\u007F]/g, '') // removes bad control chars
+      .replace(/,(\s*[}\]])/g, '$1'); // removes trailing commas
+
+    const parsed = JSON.parse(sanitizedJson);
+    return schema.parse(parsed);
+  } catch (e) {
+    console.error("failed to parse json:", jsonString);
+    throw new Error(`invalid json from model: ${jsonString}`);
+  }
+}
+
 async function generateSerpQueries({
   query,
   numQueries = 3,
@@ -30,41 +77,55 @@ async function generateSerpQueries({
 }: {
   query: string;
   numQueries?: number;
-
-  // optional, if provided, the research will continue from the last learning
   learnings?: string[];
 }) {
-  const res = await generateObject({
-    model: o3MiniModel,
-    system: systemPrompt(),
-    prompt: `Given the following prompt from the user, generate a list of SERP queries to research the topic. Return a maximum of ${numQueries} queries, but feel free to return less if the original prompt is clear. Make sure each query is unique and not similar to each other: <prompt>${query}</prompt>\n\n${
-      learnings
-        ? `Here are some learnings from previous research, use them to generate more specific queries: ${learnings.join(
-            '\n',
-          )}`
-        : ''
-    }`,
-    schema: z.object({
-      queries: z
-        .array(
-          z.object({
-            query: z.string().describe('The SERP query'),
-            researchGoal: z
-              .string()
-              .describe(
-                'First talk about the goal of the research that this query is meant to accomplish, then go deeper into how to advance the research once the results are found, mention additional research directions. Be as specific as possible, especially for additional research directions.',
-              ),
-          }),
-        )
-        .describe(`List of SERP queries, max of ${numQueries}`),
-    }),
-  });
-  console.log(
-    `Created ${res.object.queries.length} queries`,
-    res.object.queries,
-  );
+  // wait 15 seconds before calling groq
+  await new Promise(resolve => setTimeout(resolve, 30000));
 
-  return res.object.queries.slice(0, numQueries);
+  const prompt = `given the following prompt from the user, generate a list of serp queries to research the topic.
+
+### output format:
+return your response in **valid json format**, following this **exact** structure:
+\`\`\`json
+{
+  "queries": [
+    {
+      "query": "string",
+      "researchGoal": "string"
+    }
+  ]
+}
+\`\`\`
+
+### rules:
+- **only return valid json.** no explanations or extra text.
+- each query **must be unique** and not redundant.
+- each research goal should be **detailed and suggest further research directions**.
+
+user prompt:
+<prompt>${query}</prompt>
+
+${learnings ? `here are previous research learnings to refine queries: ${learnings.join('\n')}` : ''}
+`;
+
+  const schema = z.object({
+    queries: z.array(
+      z.object({
+        query: z.string(),
+        researchGoal: z.string(),
+      })
+    ),
+  });
+
+  const res = await safeGenerate({
+    model: curr_model,
+    system: systemPrompt(),
+    prompt,
+    schema,
+  });
+
+  console.log(`created ${res.queries.length} queries`, res.queries);
+  return res.queries.slice(0, numQueries);
 }
 
 async function processSerpResult({
@@ -78,38 +139,52 @@ async function processSerpResult({
   numLearnings?: number;
   numFollowUpQuestions?: number;
 }) {
-  const contents = compact(result.data.map(item => item.markdown)).map(
-    content => trimPrompt(content, 25_000),
+  const contents = compact(result.data.map(item => item.description)).map(content =>
+    trimPrompt(content, 25000)
   );
-  console.log(`Ran ${query}, found ${contents.length} contents`);
+  console.log(`ran ${query}, found ${contents.length} contents`);
 
-  const res = await generateObject({
-    model: o3MiniModel,
-    abortSignal: AbortSignal.timeout(60_000),
-    system: systemPrompt(),
-    prompt: `Given the following contents from a SERP search for the query <query>${query}</query>, generate a list of learnings from the contents. Return a maximum of ${numLearnings} learnings, but feel free to return less if the contents are clear. Make sure each learning is unique and not similar to each other. The learnings should be concise and to the point, as detailed and infromation dense as possible. Make sure to include any entities like people, places, companies, products, things, etc in the learnings, as well as any exact metrics, numbers, or dates. The learnings will be used to research the topic further.\n\n<contents>${contents
-      .map(content => `<content>\n${content}\n</content>`)
-      .join('\n')}</contents>`,
-    schema: z.object({
-      learnings: z
-        .array(z.string())
-        .describe(`List of learnings, max of ${numLearnings}`),
-      followUpQuestions: z
-        .array(z.string())
-        .describe(
-          `List of follow-up questions to research the topic further, max of ${numFollowUpQuestions}`,
-        ),
-    }),
+  // wait 15 seconds before calling groq
+  await new Promise(resolve => setTimeout(resolve, 30000));
+
+  const prompt = `given the following contents from a serp search for the query <query>${query}</query>, generate a structured json response with two fields: "learnings" and "followUpQuestions". 
+
+return your response in the following json format:
+\`\`\`json
+{
+  "learnings": ["string1", "string2", "string3"],
+  "followUpQuestions": ["question1", "question2", "question3"]
+}
+\`\`\`
+
+make sure:
+- the json is well-formed.
+- each learning is unique and contains specific details, numbers, or entities.
+- the follow-up questions help refine further research.
+
+<contents>${contents
+    .map(content => `<content>\n${content}\n</content>`)
+    .join('\n')}</contents>
+`;
+
+  const schema = z.object({
+    learnings: z.array(z.string()),
+    followUpQuestions: z.array(z.string()),
   });
-  console.log(
-    `Created ${res.object.learnings.length} learnings`,
-    res.object.learnings,
-  );
 
-  return res.object;
+  const res = await safeGenerate({
+    model: curr_model,
+    system: systemPrompt(),
+    prompt,
+    schema,
+    abortSignal: AbortSignal.timeout(60000),
+  });
+
+  console.log(`created ${res.learnings.length} learnings`, res.learnings);
+  return res;
 }
 
-export async function writeFinalReport({
+export async function writeFinalReportPdf({
   prompt,
   learnings,
   visitedUrls,
@@ -117,28 +192,108 @@ export async function writeFinalReport({
   prompt: string;
   learnings: string[];
   visitedUrls: string[];
-}) {
+}): Promise<string> {
   const learningsString = trimPrompt(
-    learnings
-      .map(learning => `<learning>\n${learning}\n</learning>`)
-      .join('\n'),
-    150_000,
+    learnings.map(l => `<learning>\n${l}\n</learning>`).join('\n'),
+    150000
   );
 
-  const res = await generateObject({
-    model: o3MiniModel,
-    system: systemPrompt(),
-    prompt: `Given the following prompt from the user, write a final report on the topic using the learnings from research. Make it as as detailed as possible, aim for 3 or more pages, include ALL the learnings from research:\n\n<prompt>${prompt}</prompt>\n\nHere are all the learnings from previous research:\n\n<learnings>\n${learningsString}\n</learnings>`,
-    schema: z.object({
-      reportMarkdown: z
-        .string()
-        .describe('Final report on the topic in Markdown'),
-    }),
+  // wait before calling the model
+  await new Promise(resolve => setTimeout(resolve, 30000));
+
+  const promptText = `given the following prompt from the user, write a final academic report on the topic using the learnings from research. make it as detailed as possible, aim for 5 or more pages, and include all research learnings.
+
+### output format:
+return your response in **valid json format**, following this exact structure:
+\`\`\`json
+{
+  "reportMarkdown": "string"
+}
+\`\`\`
+
+- **only return valid json.** no extra explanations or text.
+
+### user prompt:
+<prompt>${prompt}</prompt>
+
+### research learnings:
+<learnings>
+${learningsString}
+</learnings>
+`;
+
+  const schema = z.object({
+    reportMarkdown: z.string(),
   });
 
-  // Append the visited URLs section to the report
-  const urlsSection = `\n\n## Sources\n\n${visitedUrls.map(url => `- ${url}`).join('\n')}`;
-  return res.object.reportMarkdown + urlsSection;
+  const res = await safeGenerate({
+    model: curr_model,
+    system: systemPrompt(),
+    prompt: promptText,
+    schema,
+  });
+
+  const urlsSection = `\n\n## sources\n\n${visitedUrls.map(url => `- ${url}`).join('\n')}`;
+  const reportMarkdown = res.reportMarkdown + urlsSection;
+
+  // custom css for academic paper styling
+  const css = `
+  @page {
+    size: a4;
+    margin: 2cm;
+  }
+  body {
+    font-family: "times new roman", serif;
+    font-size: 12pt;
+    line-height: 1.6;
+    color: #000;
+    margin: 0;
+    padding: 0;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-weight: bold;
+    text-align: center;
+    margin: 1em 0 0.5em 0;
+  }
+  h1 {
+    font-size: 24pt;
+  }
+  h2 {
+    font-size: 20pt;
+  }
+  h3 {
+    font-size: 16pt;
+  }
+  p {
+    text-align: justify;
+    margin: 1em 0;
+  }
+  .title-page {
+    text-align: center;
+    margin-top: 200px;
+  }
+  .title-page h1 {
+    font-size: 28pt;
+  }
+  .title-page h2 {
+    font-size: 18pt;
+    font-weight: normal;
+  }
+  footer {
+    position: fixed;
+    bottom: 1cm;
+    text-align: center;
+    font-size: 10pt;
+    color: #666;
+  }
+  `;
+
+  const options = { stylesheet: css };
+  const pdfResult = await mdToPdf({ content: reportMarkdown, ...options });
+  const outputPath = './final-report.pdf';
+  fs.writeFileSync(outputPath, pdfResult.content);
+  console.log(`pdf saved to ${outputPath}`);
+  return outputPath;
 }
 
 export async function deepResearch({
@@ -159,19 +314,27 @@ export async function deepResearch({
     learnings,
     numQueries: breadth,
   });
+
   const limit = pLimit(ConcurrencyLimit);
 
   const results = await Promise.all(
     serpQueries.map(serpQuery =>
       limit(async () => {
         try {
+          // wait 15 seconds before calling firecrawl search
+          await new Promise(resolve => setTimeout(resolve, 30000));
+
+          if (!serpQuery?.query) {
+            console.error("invalid query: ", serpQuery);
+            return { learnings: [], visitedUrls: [] };
+          }
+
           const result = await firecrawl.search(serpQuery.query, {
             timeout: 15000,
             limit: 5,
-            scrapeOptions: { formats: ['markdown'] },
           });
 
-          // Collect URLs from this search
+          // collect urls from this search
           const newUrls = compact(result.data.map(item => item.url));
           const newBreadth = Math.ceil(breadth / 2);
           const newDepth = depth - 1;
@@ -185,13 +348,11 @@ export async function deepResearch({
           const allUrls = [...visitedUrls, ...newUrls];
 
           if (newDepth > 0) {
-            console.log(
-              `Researching deeper, breadth: ${newBreadth}, depth: ${newDepth}`,
-            );
+            console.log(`researching deeper, breadth: ${newBreadth}, depth: ${newDepth}`);
 
             const nextQuery = `
-            Previous research goal: ${serpQuery.researchGoal}
-            Follow-up research directions: ${newLearnings.followUpQuestions.map(q => `\n${q}`).join('')}
+            previous research goal: ${serpQuery.researchGoal}
+            follow-up research directions: ${newLearnings.followUpQuestions.map(q => `\n${q}`).join('')}
           `.trim();
 
             return deepResearch({
@@ -208,14 +369,11 @@ export async function deepResearch({
             };
           }
         } catch (e) {
-          console.error(`Error running query: ${serpQuery.query}: `, e);
-          return {
-            learnings: [],
-            visitedUrls: [],
-          };
+          console.error(`error running query: ${serpQuery.query}: `, e);
+          return { learnings: [], visitedUrls: [] };
         }
-      }),
-    ),
+      })
+    )
   );
 
   return {
